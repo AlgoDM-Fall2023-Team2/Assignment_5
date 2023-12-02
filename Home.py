@@ -1,22 +1,50 @@
 from openai import OpenAI
-import openai
 import boto3
 import os
+import snowflake.connector
+from dotenv import load_dotenv
 
-api_key = "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"
-openai.api_key = api_key
-
-os.environ["OPENAI_API_KEY"] = api_key
+load_dotenv()
 
 client = OpenAI()
 
-aws_access_key = "AKIAUCVRRS2K6T4FC27T"
-aws_secret_key = "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"
-aws_region = "us-east-1"
+aws_access_key = os.environ.get('aws_access_key')
+aws_secret_key = os.environ.get('aws_secret_key')
+aws_region = os.environ.get('aws_region')
 
 s3_client = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key, region_name=aws_region)
 
 objects = s3_client.list_objects_v2(Bucket = "smalladmbucket", StartAfter = '/img')
+
+conn = snowflake.connector.connect(
+    user=os.environ.get("user"),
+    password=os.environ.get("password"),
+    account=os.environ.get("account"),
+    warehouse=os.environ.get("warehouse"),
+    database=os.environ.get("database"),
+    schema=os.environ.get("schema")
+)
+
+cursor = conn.cursor()
+
+cursor.execute("""
+    CREATE SCHEMA IF NOT EXISTS my_schema
+""")
+
+cursor.close()
+
+cursor = conn.cursor()
+
+cursor.execute("""
+    CREATE OR REPLACE TABLE my_schema.my_table (
+        s3_key STRING,
+        tags STRING
+    )
+""")
+
+cursor.close()
+
+responses = []
 
 for object in objects['Contents']:
 
@@ -43,4 +71,30 @@ for object in objects['Contents']:
     max_tokens=300,
     )
 
-    print(response.choices[0].message.content)
+    tags = response.choices[0].message.content
+
+    tags_list = tags.split(sep = ',')
+
+    item = {object['Key']:tags_list}
+
+    responses.append(item)
+
+cursor = conn.cursor()
+
+for dictionary in responses:
+    for key, value in dictionary.items():
+
+        values = ','.join(value)
+        # Use MERGE INTO to upsert based on the key
+        cursor.execute("""
+            MERGE INTO my_schema.my_table AS target
+            USING (SELECT %s AS s3_key, %s AS tags) AS source
+            ON target.s3_key = source.s3_key
+            WHEN MATCHED THEN
+                UPDATE SET target.tags = source.tags
+            WHEN NOT MATCHED THEN
+                INSERT (s3_key, tags)
+                VALUES (source.s3_key, source.tags)
+        """, (key, values))
+
+cursor.close()
